@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from client_app.desktop_user_ui.process_control import pids_for_port, terminate_pids
-from client_app.desktop_user_ui.ui_helpers import guarded, set_banner
+from client_app.desktop_user_ui.ui_helpers import apply_app_theme, guarded, make_card, set_banner
 from shared.config.settings import get_settings
 
 
@@ -29,8 +29,8 @@ class AdminWindow(QMainWindow):
         super().__init__()
         self.settings = get_settings()
         self.process: subprocess.Popen[str] | None = None
-        self.setWindowTitle("Noctrix Server Setup")
-        self.resize(760, 520)
+        self.setWindowTitle("Noctrix Launcher")
+        self.resize(820, 600)
         self._build_ui()
         self.refresh_status()
         self.timer = QTimer(self)
@@ -40,10 +40,14 @@ class AdminWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(18, 18, 18, 18)
-        self.banner = QLabel("Runtime and first-run setup only. Use the client app for administration.")
+        layout.setContentsMargins(18, 16, 18, 18)
+        title = QLabel("Noctrix Launcher")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        self.banner = QLabel("Runtime and first-run setup only. Use the client workbench for administration.")
         layout.addWidget(self.banner)
 
+        runtime_card, runtime_layout = make_card("Runtime")
         runtime_form = QFormLayout()
         self.host_label = QLabel(self.settings.api_host)
         self.port_label = QLabel(str(self.settings.api_port))
@@ -62,7 +66,8 @@ class AdminWindow(QMainWindow):
             ("Backend PIDs", self.pid_label),
         ]:
             runtime_form.addRow(label, widget)
-        layout.addLayout(runtime_form)
+        runtime_layout.addLayout(runtime_form)
+        layout.addWidget(runtime_card)
 
         buttons = QHBoxLayout()
         for text, handler in [
@@ -70,12 +75,16 @@ class AdminWindow(QMainWindow):
             ("Stop", self.stop_service),
             ("Kill", self.kill_service),
             ("Refresh", self.refresh_status),
+            ("Open Client Workbench", self.open_client_workbench),
         ]:
             button = QPushButton(text)
+            if text == "Open Client Workbench":
+                button.setProperty("primary", True)
             button.clicked.connect(handler)
             buttons.addWidget(button)
         layout.addLayout(buttons)
 
+        setup_card, setup_layout = make_card("First-Run Setup")
         setup_form = QFormLayout()
         self.admin_username_input = QLineEdit("admin")
         self.admin_password_input = QLineEdit("admin12345")
@@ -94,14 +103,15 @@ class AdminWindow(QMainWindow):
             ("Admin Email", self.admin_email_input),
         ]:
             setup_form.addRow(label, widget)
-        layout.addLayout(setup_form)
+        setup_layout.addLayout(setup_form)
 
         apply_button = QPushButton("Apply Guided Setup")
         apply_button.clicked.connect(self.apply_setup)
-        layout.addWidget(apply_button)
+        setup_layout.addWidget(apply_button)
+        layout.addWidget(setup_card)
         layout.addStretch(1)
         self.setCentralWidget(root)
-        set_banner(self.banner, "Start, stop, or kill the local backend here. Full administration is in the client.")
+        set_banner(self.banner, "Start the backend here, then open the role-aware client workbench with this server preselected.")
 
     def start_service(self) -> None:
         existing = pids_for_port(self.settings.api_port)
@@ -122,6 +132,24 @@ class AdminWindow(QMainWindow):
         stopped = terminate_pids(self._known_pids(), force=True)
         set_banner(self.banner, f"Sent kill signal to: {', '.join(map(str, stopped)) or 'none'}.", ok=not bool(stopped))
         self.refresh_status()
+
+    def open_client_workbench(self) -> None:
+        base_url = f"http://{self.settings.api_host}:{self.settings.api_port}/api/v1"
+        fingerprint = self.fingerprint_label.text()
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "client_app.desktop_user_ui.main",
+                "--base-url",
+                base_url,
+                "--fingerprint",
+                fingerprint,
+                "--profile-name",
+                "Local Launcher Server",
+            ]
+        )
+        set_banner(self.banner, "Opened client workbench with the local server profile.")
 
     def refresh_status(self) -> None:
         pids = self._known_pids()
@@ -172,6 +200,7 @@ class AdminWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    apply_app_theme(app)
     window = AdminWindow()
     window.show()
     sys.exit(app.exec())
