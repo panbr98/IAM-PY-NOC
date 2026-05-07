@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from argparse import ArgumentParser, Namespace
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateTimeEdit,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -39,7 +41,7 @@ from client_app.desktop_user_ui.api_client import (
     discover_server_profiles,
     normalize_api_base_url,
 )
-from client_app.desktop_user_ui.ui_helpers import bind_combo, guarded, populate_table, selected_row_id, set_banner
+from client_app.desktop_user_ui.ui_helpers import apply_app_theme, bind_combo, guarded, make_card, populate_table, selected_row_id, set_banner
 from client_app.desktop_user_ui.process_control import pids_for_port, terminate_pids
 
 
@@ -66,7 +68,7 @@ ADMIN_ENDPOINTS = {
     "Identities": ("GET", "/identities", {"username": "new.user", "full_name": "New User", "email": "new.user@example.local", "role": "employee", "manager_id": None}),
     "Systems": ("GET", "/systems", {"name": "New System", "description": "", "owner_identity_id": None}),
     "Resources": ("GET", "/resources", {"name": "New Resource", "system_id": 1, "requestable": True, "description": ""}),
-    "Task Mappings": ("GET", "/task-mappings", {"system_id": 1, "resource_id": 1, "action": "grant", "task_type": "manual_provision", "default_owner_role": "operator", "sla_hours": 24}),
+    "Task Mappings": ("GET", "/task-mappings", {"system_id": 1, "resource_id": 1, "action": "grant", "trigger_event": "approval_approved", "task_type": "manual_provision", "default_owner_role": "operator", "sla_hours": 24, "provisioning_mode": "manual", "connector_id": None, "connector_operation": None, "connector_query_id": None, "payload_template": {}}),
     "Requests": ("GET", "/access-requests", None),
     "Approvals": ("GET", "/approvals", None),
     "Assignments": ("GET", "/resource-assignments", None),
@@ -109,13 +111,216 @@ class AdminWizard(QWizard):
             self.addPage(page)
 
 
+class JsonCrudWizard(QWizard):
+    def __init__(self, title: str, template: dict[str, Any], initial: dict[str, Any] | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(620, 520)
+        self.template = template
+        self.initial = initial or {}
+        self.widgets: dict[str, QWidget] = {}
+        self.review = QTextEdit()
+        self.review.setReadOnly(True)
+        self.currentIdChanged.connect(lambda _: self._refresh_review())
+        self._build_pages()
+
+    def _build_pages(self) -> None:
+        form_page = QWizardPage()
+        form_page.setTitle("Details")
+        form_layout = QFormLayout(form_page)
+        for key, default in self.template.items():
+            value = self.initial.get(key, default)
+            widget = self._widget_for(value, default)
+            self.widgets[key] = widget
+            form_layout.addRow(key.replace("_", " ").title(), widget)
+        self.addPage(form_page)
+
+        review_page = QWizardPage()
+        review_page.setTitle("Review")
+        review_layout = QVBoxLayout(review_page)
+        review_layout.addWidget(self.review)
+        self.addPage(review_page)
+
+    def validateCurrentPage(self) -> bool:
+        if self.currentId() != 0:
+            return True
+        try:
+            self.payload()
+        except Exception as exc:
+            QMessageBox.warning(self, "Invalid Wizard Data", str(exc))
+            return False
+        return True
+
+    def payload(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, widget in self.widgets.items():
+            default = self.template[key]
+            if isinstance(widget, QCheckBox):
+                result[key] = widget.isChecked()
+            elif isinstance(widget, QSpinBox):
+                result[key] = widget.value()
+            elif isinstance(widget, QTextEdit):
+                raw = widget.toPlainText().strip()
+                result[key] = json.loads(raw or ("[]" if isinstance(default, list) else "{}"))
+            elif isinstance(widget, QComboBox):
+                result[key] = widget.currentData()
+            else:
+                text = widget.text().strip() if isinstance(widget, QLineEdit) else ""
+                if default is None:
+                    result[key] = int(text) if text.isdigit() else None
+                elif isinstance(default, int):
+                    result[key] = int(text or 0)
+                else:
+                    result[key] = text
+        return result
+
+    def _refresh_review(self) -> None:
+        if self.currentId() == 1:
+            self.review.setPlainText(json.dumps(self.payload(), indent=2, default=str))
+
+    def _widget_for(self, value: Any, default: Any) -> QWidget:
+        if isinstance(default, bool):
+            widget = QCheckBox()
+            widget.setChecked(bool(value))
+            return widget
+        if isinstance(default, int) and not isinstance(default, bool):
+            widget = QSpinBox()
+            widget.setRange(0, 1000000)
+            widget.setValue(int(value or 0))
+            return widget
+        if isinstance(default, (dict, list)):
+            widget = QTextEdit()
+            widget.setPlainText(json.dumps(default if value in [None, ""] else value, indent=2, default=str))
+            return widget
+        return QLineEdit("" if value is None else str(value))
+
+
+class ResourceProvisioningWizard(QWizard):
+    def __init__(
+        self,
+        *,
+        systems: list[dict[str, Any]],
+        connectors: list[dict[str, Any]],
+        initial_resource: dict[str, Any] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Resource Wizard")
+        self.resize(640, 560)
+        self.systems = systems
+        self.connectors = connectors
+        self.initial_resource = initial_resource or {}
+        self.review = QTextEdit()
+        self.review.setReadOnly(True)
+        self.currentIdChanged.connect(lambda _: self._refresh_review())
+        self._build_pages()
+
+    def _build_pages(self) -> None:
+        basics = QWizardPage()
+        basics.setTitle("Resource")
+        form = QFormLayout(basics)
+        self.system_box = QComboBox()
+        for system in self.systems:
+            self.system_box.addItem(system["name"], system["id"])
+        self.resource_name = QLineEdit(str(self.initial_resource.get("name", "")))
+        self.resource_description = QLineEdit(str(self.initial_resource.get("description", "")))
+        self.requestable = QCheckBox()
+        self.requestable.setChecked(bool(self.initial_resource.get("requestable", True)))
+        form.addRow("System", self.system_box)
+        form.addRow("Resource Name", self.resource_name)
+        form.addRow("Description", self.resource_description)
+        form.addRow("Requestable", self.requestable)
+        self.addPage(basics)
+
+        provisioning = QWizardPage()
+        provisioning.setTitle("Provisioning")
+        prov_form = QFormLayout(provisioning)
+        self.provisioning_mode = QComboBox()
+        self.provisioning_mode.addItems(["manual", "automatic"])
+        self.task_type = QLineEdit("manual_provision")
+        self.owner_role = QLineEdit("operator")
+        self.sla_hours = QSpinBox()
+        self.sla_hours.setRange(1, 720)
+        self.sla_hours.setValue(24)
+        self.connector_box = QComboBox()
+        self.connector_box.addItem("None", None)
+        for connector in self.connectors:
+            self.connector_box.addItem(connector["name"], connector["id"])
+        self.connector_operation = QComboBox()
+        self.connector_operation.addItems(["provision", "deprovision", "sync", "discover", "group_sync", "reconcile"])
+        self.payload_template = QTextEdit()
+        self.payload_template.setPlainText("{}")
+        prov_form.addRow("Mode", self.provisioning_mode)
+        prov_form.addRow("Task Type", self.task_type)
+        prov_form.addRow("Owner Role", self.owner_role)
+        prov_form.addRow("SLA Hours", self.sla_hours)
+        prov_form.addRow("Connector", self.connector_box)
+        prov_form.addRow("Operation", self.connector_operation)
+        prov_form.addRow("Payload Template JSON", self.payload_template)
+        self.addPage(provisioning)
+
+        review_page = QWizardPage()
+        review_page.setTitle("Review")
+        review_layout = QVBoxLayout(review_page)
+        review_layout.addWidget(self.review)
+        self.addPage(review_page)
+
+    def validateCurrentPage(self) -> bool:
+        if self.currentId() == 0 and (self.system_box.currentData() is None or not self.resource_name.text().strip()):
+            QMessageBox.warning(self, "Resource Incomplete", "Choose a system and enter a resource name.")
+            return False
+        if self.currentId() == 1:
+            if self.provisioning_mode.currentText() == "automatic" and self.connector_box.currentData() is None:
+                QMessageBox.warning(self, "Connector Required", "Automatic provisioning requires a connector.")
+                return False
+            try:
+                json.loads(self.payload_template.toPlainText().strip() or "{}")
+            except json.JSONDecodeError as exc:
+                QMessageBox.warning(self, "Invalid JSON", str(exc))
+                return False
+        return True
+
+    def resource_payload(self) -> dict[str, Any]:
+        return {
+            "name": self.resource_name.text().strip(),
+            "system_id": int(self.system_box.currentData()),
+            "requestable": self.requestable.isChecked(),
+            "description": self.resource_description.text().strip(),
+        }
+
+    def task_mapping_payload(self, resource_id: int) -> dict[str, Any]:
+        automatic = self.provisioning_mode.currentText() == "automatic"
+        return {
+            "system_id": int(self.system_box.currentData()),
+            "resource_id": int(resource_id),
+            "action": "grant",
+            "trigger_event": "approval_approved",
+            "task_type": self.task_type.text().strip() or ("automatic_provision" if automatic else "manual_provision"),
+            "default_owner_role": self.owner_role.text().strip() or "operator",
+            "sla_hours": self.sla_hours.value(),
+            "provisioning_mode": self.provisioning_mode.currentText(),
+            "connector_id": self.connector_box.currentData() if automatic else None,
+            "connector_operation": self.connector_operation.currentText() if automatic else None,
+            "connector_query_id": None,
+            "payload_template": json.loads(self.payload_template.toPlainText().strip() or "{}"),
+        }
+
+    def _refresh_review(self) -> None:
+        if self.currentId() == 2:
+            data = self.resource_payload()
+            data["task_mapping"] = self.task_mapping_payload(self.initial_resource.get("id", 0) or 0)
+            self.review.setPlainText(json.dumps(data, indent=2, default=str))
+
+
 class ClientWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, launch_profile: dict[str, str] | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Noctrix Self-Service Portal")
-        self.resize(1180, 760)
+        self.resize(1280, 820)
         self.profile_store = ServerProfileStore()
         self.profiles = self.profile_store.load() or [DEFAULT_PROFILE]
+        if launch_profile:
+            self.profiles = self.profile_store.upsert(launch_profile)
         self.profile_store.save(self.profiles)
         self.api_client: NoctrixApiClient | None = None
         self.current_identity: dict[str, Any] | None = None
@@ -131,15 +336,17 @@ class ClientWindow(QMainWindow):
         self.approvals_by_request_id: dict[int, dict[str, Any]] = {}
         self.admin_rows_by_id: dict[int, dict[str, Any]] = {}
         self._build_ui()
-        self._load_profile_into_form(0)
+        self._load_profile_into_form(self._profile_index(launch_profile["name"]) if launch_profile else 0)
 
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QHBoxLayout(root)
-        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         self.nav = QListWidget()
-        self.nav.setFixedWidth(210)
+        self.nav.setObjectName("sidebar")
+        self.nav.setFixedWidth(225)
         for step in PORTAL_STEPS:
             QListWidgetItem(step, self.nav)
         self.nav.currentRowChanged.connect(self._on_step_changed)
@@ -147,6 +354,11 @@ class ClientWindow(QMainWindow):
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(18, 16, 18, 18)
+        content_layout.setSpacing(12)
+        self.header_label = QLabel("Noctrix Workbench")
+        self.header_label.setObjectName("pageTitle")
+        content_layout.addWidget(self.header_label)
         self.banner = QLabel("Choose a profile and sign in.")
         content_layout.addWidget(self.banner)
         self.stack = QStackedWidget()
@@ -168,6 +380,11 @@ class ClientWindow(QMainWindow):
     def _build_connection_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+        intro, intro_layout = make_card("Connection")
+        intro_layout.addWidget(QLabel("Use a local, discovered, or manual server profile. Server trust is pinned by fingerprint."))
+        layout.addWidget(intro)
+        card, card_layout = make_card("Server Profile")
         form = QFormLayout()
         self.profile_box = QComboBox()
         self.profile_box.currentIndexChanged.connect(self.on_profile_changed)
@@ -186,7 +403,7 @@ class ClientWindow(QMainWindow):
             ("Password", self.password_input),
         ]:
             form.addRow(label, widget)
-        layout.addLayout(form)
+        card_layout.addLayout(form)
         buttons = QHBoxLayout()
         for text, handler in [
             ("Save Profile", self.save_profile),
@@ -197,13 +414,22 @@ class ClientWindow(QMainWindow):
             ("Kill Local Backend", self.kill_local_backend),
         ]:
             button = QPushButton(text)
+            if text == "Connect And Sign In":
+                button.setProperty("primary", True)
             button.clicked.connect(handler)
             buttons.addWidget(button)
-        layout.addLayout(buttons)
+        card_layout.addLayout(buttons)
+        layout.addWidget(card)
         self.discovery_results = QListWidget()
         self.discovery_results.itemDoubleClicked.connect(self.use_discovered_profile)
         layout.addWidget(self.discovery_results, 1)
         return page
+
+    def _profile_index(self, name: str | None) -> int:
+        for index, profile in enumerate(self.profiles):
+            if profile.get("name") == name:
+                return index
+        return 0
 
     def _build_home_page(self) -> QWidget:
         page = QWidget()
@@ -463,32 +689,23 @@ class ClientWindow(QMainWindow):
         return page
 
     def open_connector_query_wizard(self) -> None:
-        wizard = AdminWizard(
-            "Connector Query Wizard",
-            [
-                ("Connector", QLabel("Choose system and connector")),
-                ("Operation", QLabel("Discovery, import, reconciliation, or group sync")),
-                ("Query JSON", QLabel("Configure query or preview payload JSON")),
-                ("Review", QLabel("Review connector query before saving")),
-            ],
-            self,
-        )
-        wizard.exec()
+        self._open_json_crud_wizard("Connector Queries", selected_row_id(self.admin_table))
 
     def open_scim_mapping_wizard(self) -> None:
-        wizard = AdminWizard(
-            "SCIM Mapping Wizard",
-            [
-                ("Connector And System", QLabel("Choose the SCIM connector context")),
-                ("SCIM Group", QLabel("Choose source group")),
-                ("Resource", QLabel("Choose target resource")),
-                ("Active Flag", QLabel("Enable or disable mapping")),
-                ("Review", QLabel("Review Groups:<id> to resources:<id> mapping")),
-            ],
-            self,
-        )
-        if wizard.exec():
-            self.create_admin_scim_mapping()
+        initial = self.admin_scim_mapping_rows_by_id.get(selected_row_id(self.admin_scim_mappings_table) or -1)
+        wizard = JsonCrudWizard("SCIM Mapping Wizard", {"scim_group_id": "", "resource_id": 1, "direction": "inbound", "active": True}, initial, self)
+        if wizard.exec() and self.api_client:
+            payload = wizard.payload()
+
+            def action() -> None:
+                mapping_id = selected_row_id(self.admin_scim_mappings_table)
+                if mapping_id is None:
+                    self.api_client.create_scim_mapping(**payload)
+                else:
+                    self.api_client.update_scim_mapping(mapping_id, **payload)
+                self.refresh_admin_scim()
+
+            guarded(self, "SCIM Mapping Wizard Failed", action)
 
     def _build_admin_raw_tab(self) -> QWidget:
         page = QWidget()
@@ -513,6 +730,8 @@ class ClientWindow(QMainWindow):
         buttons = QHBoxLayout()
         for text, handler in [
             ("Provisioning Mapping Wizard", self.open_provisioning_mapping_wizard),
+            ("New With Wizard", lambda: self._open_json_crud_wizard(self.admin_endpoint_box.currentText(), None)),
+            ("Edit With Wizard", lambda: self._open_json_crud_wizard(self.admin_endpoint_box.currentText(), selected_row_id(self.admin_table))),
             ("Refresh", self.refresh_admin_endpoint),
             ("Template", self.load_admin_template),
             ("Create", self.admin_create),
@@ -528,6 +747,8 @@ class ClientWindow(QMainWindow):
 
     def _on_step_changed(self, row: int) -> None:
         self.stack.setCurrentIndex(max(row, 0))
+        if 0 <= row < len(PORTAL_STEPS):
+            self.header_label.setText(PORTAL_STEPS[row])
         self._update_action_buttons()
 
     def _refresh_profile_box(self) -> None:
@@ -618,8 +839,11 @@ class ClientWindow(QMainWindow):
         def action() -> None:
             self.api_client = NoctrixApiClient(self.endpoint_input.text().strip())
             info = self.api_client.get_server_info()
-            if info["fingerprint"] != self.fingerprint_input.text().strip():
+            trusted_fingerprint = self.fingerprint_input.text().strip()
+            if trusted_fingerprint and info["fingerprint"] != trusted_fingerprint:
                 raise ValueError("Server fingerprint does not match the selected trust value.")
+            if not trusted_fingerprint:
+                self.fingerprint_input.setText(info["fingerprint"])
             self.api_client.login(self.username_input.text().strip(), self.password_input.text())
             self.current_identity = self.api_client.get_me()
             self.current_permissions = self.api_client.get_permissions()
@@ -848,46 +1072,68 @@ class ClientWindow(QMainWindow):
         guarded(self, "Catalog Refresh Failed", action)
 
     def open_system_wizard(self) -> None:
-        wizard = AdminWizard(
-            "System Wizard",
-            [
-                ("Basics", QLabel("System name and description")),
-                ("Owner Selection", QLabel("Choose an owner identity")),
-                ("Review", QLabel("Review system details before saving")),
-            ],
-            self,
-        )
-        if wizard.exec():
-            self._mutate_admin_system(selected_row_id(self.admin_systems_table))
+        system_id = selected_row_id(self.admin_systems_table)
+        wizard = JsonCrudWizard("System Wizard", {"name": "", "description": "", "owner_identity_id": None}, self.admin_system_rows_by_id.get(system_id or -1), self)
+        if wizard.exec() and self.api_client:
+            payload = wizard.payload()
+
+            def action() -> None:
+                if system_id is None:
+                    self.api_client.create_system(**payload)
+                else:
+                    self.api_client.update_system(system_id, **payload)
+                self.refresh_admin_catalog()
+
+            guarded(self, "System Wizard Failed", action)
 
     def open_resource_wizard(self) -> None:
-        wizard = AdminWizard(
-            "Resource Wizard",
-            [
-                ("System Selection", QLabel("Every resource requires a system")),
-                ("Resource Basics", QLabel("Name, description, and requestability")),
-                ("Provisioning Mode", QLabel("Manual or automatic provisioning task mapping")),
-                ("Optional SCIM Group Mapping", QLabel("Connect a SCIM group to this resource")),
-                ("Review", QLabel("Review resource details before saving")),
-            ],
-            self,
+        if not self.api_client:
+            return
+        resource_id = selected_row_id(self.admin_resources_table)
+        connectors = guarded(self, "Connector Load Failed", self.api_client.get_connectors) or []
+        wizard = ResourceProvisioningWizard(
+            systems=list(self.systems_by_id.values()),
+            connectors=connectors,
+            initial_resource=self.admin_resource_rows_by_id.get(resource_id or -1),
+            parent=self,
         )
         if wizard.exec():
-            self._mutate_admin_resource(selected_row_id(self.admin_resources_table))
+            def action() -> None:
+                if resource_id is None:
+                    resource = self.api_client.create_resource(**wizard.resource_payload())
+                    self.api_client.create_task_mapping(**wizard.task_mapping_payload(int(resource["id"])))
+                else:
+                    self.api_client.update_resource(resource_id, **wizard.resource_payload())
+                self.refresh_admin_catalog()
+                self.refresh_admin_endpoint()
+
+            guarded(self, "Resource Wizard Failed", action)
 
     def open_provisioning_mapping_wizard(self) -> None:
-        wizard = AdminWizard(
-            "Provisioning Mapping Wizard",
-            [
-                ("Resource", QLabel("Choose system and resource")),
-                ("Trigger", QLabel("Choose trigger_event and action")),
-                ("Provisioning Mode", QLabel("Manual queue or automatic connector execution")),
-                ("Connector Payload", QLabel("Optional connector query and payload template JSON")),
-                ("Review", QLabel("Review task mapping before saving")),
-            ],
-            self,
-        )
-        wizard.exec()
+        self._open_json_crud_wizard("Task Mappings", selected_row_id(self.admin_table))
+
+    def _open_json_crud_wizard(self, label: str, row_id: int | None) -> None:
+        if not self.api_client:
+            return
+        _, path, template = ADMIN_ENDPOINTS.get(label, ("GET", "", None))
+        if not template:
+            QMessageBox.information(self, "No Wizard", f"{label} is read-only or action-only.")
+            return
+        row = self.admin_rows_by_id.get(row_id or -1)
+        wizard = JsonCrudWizard(f"{label} Wizard", template, row, self)
+        if not wizard.exec():
+            return
+
+        def action() -> None:
+            if row_id is None:
+                self.api_client.post_path(path, wizard.payload())
+            else:
+                self.api_client.put_path(f"{path}/{row_id}", wizard.payload())
+            self.refresh_admin_endpoint()
+            if label in {"Systems", "Resources", "Task Mappings"}:
+                self.refresh_admin_catalog()
+
+        guarded(self, f"{label} Wizard Failed", action)
 
     def create_admin_system(self) -> None:
         self._mutate_admin_system(None)
@@ -1353,10 +1599,31 @@ def modules_for_permissions(permissions: list[str]) -> list[str]:
 
 
 def main() -> None:
-    app = QApplication(sys.argv)
-    window = ClientWindow()
+    args = _parse_args()
+    launch_profile = None
+    if args.base_url:
+        launch_profile = {
+            "name": args.profile_name or "Launcher Profile",
+            "base_url": normalize_api_base_url(args.base_url),
+            "fingerprint": args.fingerprint or "",
+            "bootstrap_mode": "launcher",
+        }
+    app = QApplication(sys.argv[:1])
+    apply_app_theme(app)
+    window = ClientWindow(launch_profile)
+    if args.username:
+        window.username_input.setText(args.username)
     window.show()
     sys.exit(app.exec())
+
+
+def _parse_args() -> Namespace:
+    parser = ArgumentParser(add_help=True)
+    parser.add_argument("--base-url", default="")
+    parser.add_argument("--fingerprint", default="")
+    parser.add_argument("--profile-name", default="")
+    parser.add_argument("--username", default="")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":

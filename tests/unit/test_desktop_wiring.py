@@ -111,7 +111,7 @@ def test_desktop_entrypoints_instantiate_offscreen(monkeypatch: pytest.MonkeyPat
     server_window = server_module.AdminWindow()
 
     assert client_window.windowTitle() == "Noctrix Self-Service Portal"
-    assert server_window.windowTitle() == "Noctrix Server Setup"
+    assert server_window.windowTitle() == "Noctrix Launcher"
     client_window.close()
     server_window.close()
     app.processEvents()
@@ -164,7 +164,7 @@ def test_client_admin_has_guided_catalog_assignments_and_scim_controls() -> None
     assert "Create Connector" in source
     assert "System Wizard" in source
     assert "Resource Wizard" in source
-    assert "Connector Query Wizard" in source
+    assert "Connector Queries" in source
     assert "SCIM Mapping Wizard" in source
     assert "Provisioning Mapping Wizard" in source
     assert "provisioning_mode" in Path("shared/schemas/domain.py").read_text(encoding="utf-8")
@@ -174,6 +174,8 @@ def test_client_admin_has_guided_catalog_assignments_and_scim_controls() -> None
 def test_server_app_is_minimal_runtime_setup() -> None:
     source = Path("server_app/desktop_admin_ui/main.py").read_text(encoding="utf-8")
     assert "Runtime and first-run setup only" in source
+    assert "Noctrix Launcher" in source
+    assert "Open Client Workbench" in source
     assert "stop_service" in source
     assert "kill_service" in source
     assert "Catalog & Governance" not in source
